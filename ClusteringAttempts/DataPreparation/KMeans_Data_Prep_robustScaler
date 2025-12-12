@@ -1,0 +1,97 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
+
+# 1) Loading and preprocessing the data, normalising the tickers to uppercase
+df = pd.read_csv('prices.csv')
+df['date'] = pd.to_datetime(df['date'])
+df['ticker'] = df['ticker'].str.upper()
+tickers = ['XLK', 'XLP', 'XLV', 'XLF', 'XLE', 'XLI']
+
+# Weekly prices (Friday close) - converting long to wide , .ffil to keep continuity. weekly to reduce noise
+wide_weekly = (
+    df[df['ticker'].isin(tickers)]
+      .pivot(index='date', columns='ticker', values='adj_close')
+      .resample('W-FRI').last()
+      .ffill()
+      .dropna()
+)
+
+# 2) Features: weekly returns, 12w vol, 6w momentum, market aggregates
+#for capturing recent behaviour across sectors. Market regimes (bull/neutral/bear)
+returns = np.log(wide_weekly / wide_weekly.shift(1)).dropna()
+features = pd.DataFrame({
+    **{f'{t}_return': returns[t] for t in tickers},
+    **{f'{t}_vol_12w': returns[t].rolling(12).std() for t in tickers},
+    **{f'{t}_mom_6w': returns[t].rolling(6).mean() for t in tickers},
+    'market_return': returns.mean(axis=1), #average return
+    'market_vol': returns.std(axis=1) #cross sectional vol
+}).dropna()
+
+# 3) Train/Test split. Splitting features into train (up to and including 2019-01-04) - 
+#k-means is being fit only on train, then applied to test. Doing so avoids look-ahead.
+SPLIT_DATE = pd.Timestamp("2019-01-04")
+train_mask = features.index <= SPLIT_DATE
+test_mask  = features.index >  SPLIT_DATE
+X_train, X_test = features.loc[train_mask], features.loc[test_mask]
+
+# Scaling - 
+# having unscaled features can dominate in areas, train-only keeps it leakeage safe.
+scaler = RobustScaler()
+X_train_z = scaler.fit_transform(X_train)
+X_test_z  = scaler.transform(X_test)
+
+# 4) Test multiple K values
+# each K fits k-means on train, assigns labels to train and predict lables to test.
+K_values = [2, 3, 4]
+
+for K in K_values:
+    print(f"\n{'-------------------------------'}")
+    print(f"K = {K}")
+    
+    # Cluster
+    kmeans = KMeans(n_clusters=K, random_state=42, n_init=50)
+    labels_train = kmeans.fit_predict(X_train_z)
+    labels_test = kmeans.predict(X_test_z)
+    
+    # metrics on train for silhouette and calinski-harabaz
+    if K > 1: 
+        sil_train = silhouette_score(X_train_z, labels_train)
+        ch_train = calinski_harabasz_score(X_train_z, labels_train)
+        print(f"Silhouette: {sil_train:.3f} | CH: {ch_train:.1f}")
+    else:
+        print(f"Silhouette: N/A (K=1) | CH: N/A")
+
+    # Cluster interpretation on train
+    summary = X_train.assign(label=labels_train).groupby("label")[["market_return","market_vol"]].mean()
+    if K == 2:
+        tags = (summary["market_return"] > 0).map({True: "BULL", False: "BEAR"})
+    else:
+        r_med, v_med = summary["market_return"].median(), summary["market_vol"].median()
+        tags = summary.apply(lambda r: "BULL" if (r.market_return > r_med and r.market_vol <= v_med)
+                            else ("BEAR" if (r.market_return < r_med and r.market_vol >= v_med)
+                                else "NEUTRAL"), axis=1)
+    print("\n[INTERPRETATION - TRAIN]")
+    print("\n".join([f"Cluster {int(i)}: ret={r.market_return:.4f}, vol={r.market_vol:.4f} -> {tags.loc[i]}"
+                    for i, r in summary.iterrows()]))
+
+            
+    # 5) Save regime file for this K - using lagged regime features to acoid look-ahead
+    #combining train/test labels into one series aligned to the full index
+    regimes = pd.Series(index=features.index, dtype="Int64", name="regime")
+    regimes.loc[train_mask] = labels_train
+    regimes.loc[test_mask]  = labels_test
+    
+    regime_df = pd.DataFrame({
+        'date': regimes.index,
+        'regime': regimes,
+        'regime_lag1': regimes.shift(1)
+    })
+    
+    filename = f"detected_regimes_k{K}_robustscaler.csv"
+    regime_df.to_csv(filename, index=False)
+    print(f"Saved: {filename}")
+
+print("\n" + "-----------------------------------------------------")
