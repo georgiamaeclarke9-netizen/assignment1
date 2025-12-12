@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import ElasticNet
@@ -6,6 +8,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 from sklearn.dummy import DummyRegressor
+from pathlib import Path
+from typing import List, Optional, Tuple, Type
 
 class Student:
 
@@ -42,6 +46,8 @@ class Student:
         self.min_train_points = int(min_train_points)
         self.random_state = int(random_state)
         
+        # Store regime_file for walk-forward
+        self.regime_file = regime_file
 
         # Loading regime labels
         self.regime_df = pd.read_csv(regime_file)
@@ -90,7 +96,81 @@ class Student:
         self._train_columns = None       # columns (and order) seen at train
 
     
-    # helper methods (same as part 1 CW)
+    # mltester stuff:
+    @staticmethod
+    def forward_log_return(close: pd.Series, horizon: int) -> pd.Series:
+        """
+        y_t = log(C_{t+H} / C_t). NaNs at the tail where future isn't available.
+        """
+        close = pd.Series(close).astype(float)
+        return np.log(close.shift(-horizon) / close)
+    
+    @staticmethod
+    def compute_metrics(y_true: pd.Series, y_pred: pd.Series) -> Tuple[float, float, float]:
+        """
+        Return (DirAcc, MAE, RMSE) on overlapping, finite indices.
+        """
+        df = pd.concat([y_true.rename("y"), y_pred.rename("yhat")], axis=1)
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
+        if df.empty:
+            return (float("nan"), float("nan"), float("nan"))
+        diracc = float((np.sign(df["y"]) == np.sign(df["yhat"])).mean())
+        mae = float(np.abs(df["y"] - df["yhat"]).mean())
+        rmse = float(np.sqrt(((df["y"] - df["yhat"]) ** 2).mean()))
+        return diracc, mae, rmse
+    
+    def walk_forward_predict(self, prices: pd.DataFrame, horizon: int = 1, step: int = 10):
+        if "Close" not in prices.columns:
+            raise ValueError("prices must contain a 'Close' column")
+
+        # Build full target once
+        y_full = self.forward_log_return(prices["Close"], horizon=horizon)
+        y_full.name = "y_true"
+        test_dates = y_full.dropna().index
+
+        preds = []
+        for i in range(0, len(test_dates), step):
+            block = test_dates[i : i + step]
+            first_test = block[0]
+
+            X_train = prices.loc[: first_test - pd.Timedelta(days=1)]
+            y_train = y_full.loc[: first_test - pd.Timedelta(days=1)]
+
+            # Create fresh model for this block
+            model = Student(
+                n_lags=self.n_lags,
+                mom_windows=self.mom_windows,
+                vol_window=self.vol_window,
+                sma_windows=self.sma_windows,
+                ema_windows=self.ema_windows,
+                rsi_window=self.rsi_window,
+                alpha_grid=self.alpha_grid,
+                cv_splits=self.cv_splits,
+                min_train_points=self.min_train_points,
+                random_state=self.random_state,
+                regime_file=self.regime_file
+            )
+
+            model.fit(X_train, y_train, meta={"horizon": horizon})
+            X_pred = prices.loc[: block[-1]]
+            y_hat = model.predict(X_pred, meta={"horizon": horizon})
+
+            preds.append(y_hat.reindex(block).dropna())
+
+        y_pred = pd.concat(preds) if preds else pd.Series(dtype=float, name="y_pred")
+        y_pred.name = "y_pred"
+        y_true = y_full.reindex(y_pred.index)
+        y_true.name = "y_true"
+        return y_true, y_pred
+    
+    def evaluate_ticker(self, prices: pd.DataFrame, horizon: int = 1, step: int = 10):
+        #evaluating single ticker and return metrics 
+        y_true, y_pred = self.walk_forward_predict(prices, horizon=horizon, step=step)
+        diracc, mae, rmse = self.compute_metrics(y_true, y_pred)
+        return diracc, mae, rmse
+   
+    
+    # helper methods same as P1 CW
     @staticmethod
     def _close_series(X: pd.DataFrame) -> pd.Series:
         return X["Close"] if "Close" in X.columns else X.iloc[:, 0]
@@ -139,13 +219,13 @@ class Student:
         except Exception:
             return 0  # Default on error
 
-    # feature creation
+    #feature creation
     def _make_features(self, X: pd.DataFrame) -> pd.DataFrame:
 
         close = self._close_series(X).astype(float)
         lr = self._log_returns(close)
         
-        # same as part 1 CW
+        #same as part 1 CW
         feats = {}
         
         for i in range(1, self.n_lags + 1):
@@ -290,3 +370,89 @@ class Student:
 
         y_hat = self.pipe_.predict(F.values)
         return pd.Series(y_hat, index=F.index, name="y_pred")
+
+
+# main method for running eval
+def main():
+    
+    # parameters
+    tickers = ["XLE", "XLF", "XLI", "XLK", "XLP", "XLV"]
+    horizons = [1, 5, 10, 20, 40, 50, 70, 100]
+    step = 10
+    data_file = "prices.csv"
+    
+    # testing for k=2, k=3, k=4
+    for k in [2]:
+        print(f"\n{'='*50}")
+        print(f"TESTING K={k} REGIMES")
+        print('='*50)
+        
+        # Store results for this K
+        mean_diraccuracies = []
+        mean_mae = []
+        mean_rmse = []
+        
+        # Load data once
+        df = pd.read_csv(data_file)
+        df['date'] = pd.to_datetime(df['date'])
+        df.columns = [c.lower() for c in df.columns]
+        
+        for horizon in horizons:
+            print(f"\nEvaluating horizon {horizon} days...")
+            
+            rows = []
+            
+            for t in tickers:
+                # Prepare ticker data
+                ticker_df = df[df['ticker'] == t].copy()
+                ticker_df = ticker_df[['date', 'adj_close']]
+                ticker_df.columns = ['Date', 'Close']
+                ticker_df = ticker_df.set_index('Date')
+                
+                # Create Student instance
+                student = Student(regime_file=f'regimes_mcgreevy_weekly.csv')
+                
+                # Evaluate ticker
+                diracc, mae, rmse = student.evaluate_ticker(
+                    ticker_df, 
+                    horizon=horizon, 
+                    step=step
+                )
+                
+                rows.append({
+                    'ticker': t,
+                    'diracc': diracc,
+                    'mae': mae,
+                    'rmse': rmse
+                })
+                
+                print(f"{t:>6}: DirAcc={diracc:0.4f}  MAE={mae:0.6f}  RMSE={rmse:0.6f}")
+            
+            # Create summary
+            summary = pd.DataFrame(rows).sort_values("ticker").reset_index(drop=True)
+            if not summary.empty:
+                mean_row = {
+                    'ticker': 'MEAN',
+                    'diracc': float(summary["diracc"].mean()),
+                    'mae': float(summary["mae"].mean()),
+                    'rmse': float(summary["rmse"].mean())
+                }
+                
+                mean_diraccuracies.append(mean_row['diracc'])
+                mean_mae.append(mean_row['mae'])
+                mean_rmse.append(mean_row['rmse'])
+                
+                # printing in the same format as my P1 CW
+                print(f"Horizon {horizon:3d} days: DirAcc={mean_row['diracc']:.3f} | MAE={mean_row['mae']:.4f} | RMSE={mean_row['rmse']:.4f}")
+        
+        # Print summary for K[2, 3, 4]
+        print(f"\nK={k} Summary:")
+        print(f"Average DirAcc across horizons: {np.mean(mean_diraccuracies):.3f}")
+        print(f"Average MAE across horizons:    {np.mean(mean_mae):.4f}")
+        print(f"Average RMSE across horizons:   {np.mean(mean_rmse):.4f}")
+    
+#TODO add graphs if time allows - I need to focus on experimenting
+
+if __name__ == "__main__":
+
+    main()

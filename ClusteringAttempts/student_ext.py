@@ -382,10 +382,7 @@ def main():
     data_file = "prices.csv"
     
     # testing for k=2, k=3, k=4
-    for k in [2, 3, 4]:
-        print(f"\n{'='*50}")
-        print(f"TESTING K={k} REGIMES")
-        print('='*50)
+    for k in [2]:
         
         # Store results for this K
         mean_diraccuracies = []
